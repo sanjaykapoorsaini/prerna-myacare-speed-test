@@ -3,8 +3,18 @@ import time
 import os
 import re
 import json
+import sys
 from datetime import datetime
 from playwright.sync_api import sync_playwright
+from runlog import (
+    attach_page_logs,
+    open_pagespeed_browser,
+    is_archived_report_url,
+    mark_pagespeed_finished,
+    setup_run_log,
+    wait_for_pagespeed,
+    wait_for_pagespeed_slot,
+)
 
 # =========================================================
 # CONFIG
@@ -26,6 +36,12 @@ os.makedirs(PDF_FOLDER, exist_ok=True)
 
 timestamp   = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
 OUTPUT_FILE = os.path.join(folder_name, f"{strategy}_results_{timestamp}.xlsx")
+logger, LOG_FILE = setup_run_log(folder_name, strategy, timestamp)
+logger.info("Starting %s run", strategy)
+logger.info("Input file: %s", INPUT_FILE)
+logger.info("Results file: %s", OUTPUT_FILE)
+logger.info("PDF folder: %s", PDF_FOLDER)
+logger.info("Browser: visible Google Chrome (website PDF). Set PSI_HEADLESS=1 to hide the window.")
 
 # =========================================================
 # HELPERS
@@ -121,8 +137,8 @@ def extract_from_dom(page):
             "Speed Index"   : speed_index,
         }
 
-    except Exception as e:
-        print(f"    [DOM] Failed: {e}")
+    except Exception:
+        logger.exception("DOM extraction failed")
         return _empty_metrics()
 
 # =========================================================
@@ -221,7 +237,7 @@ def wait_for_report_truly_ready(page, max_wait=240):
 
             print(f"  [Ready] Waiting... scores={sc}, metrics={mc}")
         except Exception as e:
-            print(f"  [Ready] Probe error: {e}")
+            logger.warning("Ready probe failed while waiting for scores: %s", e)
 
         page.wait_for_timeout(3000)
     else:
@@ -317,7 +333,7 @@ def wait_for_report_truly_ready(page, max_wait=240):
             prev_snapshot = snap
 
         except Exception as e:
-            print(f"  [Ready] Stability error: {e}")
+            logger.warning("Stability check failed: %s", e)
 
         page.wait_for_timeout(poll_interval)
 
@@ -361,6 +377,7 @@ def _values_look_reasonable(scores, metrics):
 
         return True
     except Exception:
+        logger.warning("Value sanity check failed", exc_info=True)
         return False
 
 # =========================================================
@@ -393,8 +410,8 @@ def verify_by_reload(page, original_metrics, report_url):
                 timeout=90000,
                 state="visible"
             )
-        except Exception:
-            pass
+        except Exception as e:
+            logger.warning("Gauge did not appear after reload: %s", e)
 
         # Wait for loading indicators to clear
         for _ in range(15):
@@ -417,8 +434,8 @@ def verify_by_reload(page, original_metrics, report_url):
             print(f"     Reload  : {reload_metrics}")
             return reload_metrics, "CORRECTED_BY_RELOAD"
 
-    except Exception as e:
-        print(f"  [Verify] Reload failed: {e}")
+    except Exception:
+        logger.exception("Reload verification failed for %s", report_url)
         return original_metrics, "RELOAD_FAILED"
 
 # =========================================================
@@ -436,22 +453,12 @@ def analyze_and_save_pdf(url, pdf_path, retries=3):
       6. Save PDF from the verified state
     """
     for attempt in range(retries):
+        wait_for_pagespeed_slot()
         try:
             with sync_playwright() as p:
 
-                browser = p.chromium.launch(
-                    headless=True,
-                    channel="chrome",
-                    args=[
-                        "--disable-dev-shm-usage",
-                        "--no-sandbox",
-                        "--disable-gpu",
-                    ]
-                )
-
-                page = browser.new_page(
-                    viewport={"width": 1400, "height": 900}
-                )
+                browser, page, psi_responses = open_pagespeed_browser(p)
+                attach_page_logs(page)
 
                 psi_url = (
                     f"https://pagespeed.web.dev/analysis"
@@ -467,25 +474,37 @@ def analyze_and_save_pdf(url, pdf_path, retries=3):
                     timeout=240000
                 )
 
-                page.wait_for_url(
-                    "**/analysis/**",
-                    timeout=240000
+                report_url, problem, retry_after = wait_for_pagespeed(
+                    page,
+                    timeout_s=240,
+                    response_state=psi_responses,
                 )
-                report_url = page.url
-                print(f"  [Run] Report URL: {report_url}")
-
-                page.wait_for_timeout(3000)
-                page_content = page.content()
-                if any(kw in page_content for kw in [
-                    "Oops! Something went wrong",
-                    "RPC::UNREACHABLE",
-                    "UNABLE_TO_RETRY",
-                    "Lighthouse returned error",
-                ]):
-                    print(f"  [Run] PSI error. Retry {attempt+1}")
+                if problem:
                     browser.close()
-                    time.sleep(15)
+                    mark_pagespeed_finished()
+                    limited = (
+                        "429" in problem
+                        or "rate limit" in problem.lower()
+                        or "Unable to resolve" in problem
+                    )
+                    if limited:
+                        logger.error(
+                            "Stopped without reloading. Another page load would start a new "
+                            "analysis and keep the rate limit going. Scores still come from the "
+                            "website PDF. Wait about 15 minutes, then run this script once."
+                        )
+                        break
+                    logger.error(
+                        "Attempt %s/%s did not get a PageSpeed report for %s. Retrying in %ss.",
+                        attempt + 1,
+                        retries,
+                        url,
+                        retry_after,
+                    )
+                    time.sleep(retry_after)
                     continue
+
+                print(f"  [Run] Report URL: {report_url}")
 
                 # ── Multi-signal readiness wait ───────────────
                 wait_for_report_truly_ready(page, max_wait=240)
@@ -500,9 +519,16 @@ def analyze_and_save_pdf(url, pdf_path, retries=3):
                 # ── RELOAD VERIFICATION ───────────────────────
                 # Archived reports are immutable — reload gives
                 # us the FINAL values stored in PSI's database
-                final_metrics, verify_status = verify_by_reload(
-                    page, metrics_initial, report_url
-                )
+                if is_archived_report_url(report_url):
+                    final_metrics, verify_status = verify_by_reload(
+                        page, metrics_initial, report_url
+                    )
+                else:
+                    logger.warning(
+                        "Report URL is not an archived PageSpeed link, skipping reload check: %s",
+                        report_url,
+                    )
+                    final_metrics, verify_status = metrics_initial, "VISIBLE_NO_ARCHIVE_URL"
 
                 # ── Dismiss overlays again post-reload ────────
                 dismiss_overlays(page)
@@ -516,8 +542,8 @@ def analyze_and_save_pdf(url, pdf_path, retries=3):
                         print_background=True
                     )
                     print(f"  [PDF] Saved: {pdf_path}")
-                except Exception as e:
-                    print(f"  [PDF] Save failed: {e}")
+                except Exception:
+                    logger.exception("PDF save failed: %s", pdf_path)
 
                 # ── Final extraction post-PDF (sanity) ────────
                 post_pdf = extract_from_dom(page)
@@ -531,6 +557,7 @@ def analyze_and_save_pdf(url, pdf_path, retries=3):
                     final_metrics = post_pdf
                     verify_status += "+POST_DRIFT"
 
+                mark_pagespeed_finished()
                 browser.close()
 
                 return {
@@ -539,10 +566,17 @@ def analyze_and_save_pdf(url, pdf_path, retries=3):
                     **final_metrics
                 }
 
-        except Exception as e:
-            print(f"  [Run] Attempt {attempt+1} failed: {e}")
+        except Exception:
+            mark_pagespeed_finished()
+            logger.exception(
+                "Attempt %s/%s failed for %s",
+                attempt + 1,
+                retries,
+                url,
+            )
             time.sleep(15)
 
+    logger.error("Giving up on %s after %s attempts", url, retries)
     return {
         "Report Link"     : "N/A",
         "Extraction Flag" : "FAILED",
@@ -550,91 +584,109 @@ def analyze_and_save_pdf(url, pdf_path, retries=3):
     }
 
 # =========================================================
-# READ INPUT
+# READ INPUT AND RUN
 # =========================================================
 
-df = pd.read_excel(INPUT_FILE)
 final_results = []
 
-# =========================================================
-# PROCESS EACH ROW
-# =========================================================
+try:
+    logger.info("Reading input %s", INPUT_FILE)
+    df = pd.read_excel(INPUT_FILE)
+    required_cols = ["Live", "Live Replica"]
+    missing_cols = [col for col in required_cols if col not in df.columns]
+    if missing_cols:
+        raise ValueError(
+            f"{INPUT_FILE} is missing columns {missing_cols}. "
+            f"Found {list(df.columns)}"
+        )
+    logger.info("Loaded %s row(s) from %s", len(df), INPUT_FILE)
 
-for index, row in df.iterrows():
+    for index, row in df.iterrows():
+        try:
+            live_url    = str(row['Live']).strip()
+            replica_url = str(row['Live Replica']).strip()
 
-    live_url    = str(row['Live']).strip()
-    replica_url = str(row['Live Replica']).strip()
+            if live_url.lower() in ("", "nan") or replica_url.lower() in ("", "nan"):
+                logger.error(
+                    "Row %s skipped: empty URL (Live=%r, Live Replica=%r)",
+                    index + 1,
+                    row.get("Live"),
+                    row.get("Live Replica"),
+                )
+                continue
+
+            print(f"\n{'='*60}")
+            print(f"Row {index + 1}")
+            print(f"  Live    : {live_url}")
+            print(f"  Replica : {replica_url}")
+            print(f"{'='*60}")
+
+            live_pdf_name = sanitize_filename(live_url) + f"_LIVE_{strategy}.pdf"
+            live_pdf_path = os.path.join(PDF_FOLDER, live_pdf_name)
+
+            print("\n[LIVE]")
+            live_data = analyze_and_save_pdf(live_url, live_pdf_path)
+
+            time.sleep(3)
+
+            replica_pdf_name = sanitize_filename(replica_url) + f"_REPLICA_{strategy}.pdf"
+            replica_pdf_path = os.path.join(PDF_FOLDER, replica_pdf_name)
+
+            print("\n[REPLICA]")
+            replica_data = analyze_and_save_pdf(replica_url, replica_pdf_path)
+
+            final_results.append({
+                "Live URL"               : live_url,
+                "Replica URL"            : replica_url,
+
+                "Live Report Link"       : live_data["Report Link"],
+                "Replica Report Link"    : replica_data["Report Link"],
+
+                "Live Status"            : live_data.get("Extraction Flag", ""),
+                "Replica Status"         : replica_data.get("Extraction Flag", ""),
+
+                "Live Performance"       : live_data["Performance"],
+                "Replica Performance"    : replica_data["Performance"],
+
+                "Live Accessibility"     : live_data["Accessibility"],
+                "Replica Accessibility"  : replica_data["Accessibility"],
+
+                "Live Best Practices"    : live_data["Best Practices"],
+                "Replica Best Practices" : replica_data["Best Practices"],
+
+                "Live SEO"               : live_data["SEO"],
+                "Replica SEO"            : replica_data["SEO"],
+
+                "Live FCP"               : live_data["FCP"],
+                "Replica FCP"            : replica_data["FCP"],
+
+                "Live LCP"               : live_data["LCP"],
+                "Replica LCP"            : replica_data["LCP"],
+
+                "Live TBT"               : live_data["TBT"],
+                "Replica TBT"            : replica_data["TBT"],
+
+                "Live CLS"               : live_data["CLS"],
+                "Replica CLS"            : replica_data["CLS"],
+
+                "Live Speed Index"       : live_data["Speed Index"],
+                "Replica Speed Index"    : replica_data["Speed Index"],
+
+                "Live PDF Path"          : live_pdf_path,
+                "Replica PDF Path"       : replica_pdf_path,
+            })
+
+            time.sleep(3)
+        except Exception:
+            logger.exception("Row %s failed", index + 1)
+
+    output_df = pd.DataFrame(final_results)
+    output_df.to_excel(OUTPUT_FILE, index=False)
 
     print(f"\n{'='*60}")
-    print(f"Row {index + 1}")
-    print(f"  Live    : {live_url}")
-    print(f"  Replica : {replica_url}")
+    print(f"Done! Output: {OUTPUT_FILE}")
     print(f"{'='*60}")
-
-    live_pdf_name = sanitize_filename(live_url) + f"_LIVE_{strategy}.pdf"
-    live_pdf_path = os.path.join(PDF_FOLDER, live_pdf_name)
-
-    print("\n[LIVE]")
-    live_data = analyze_and_save_pdf(live_url, live_pdf_path)
-
-    time.sleep(3)
-
-    replica_pdf_name = sanitize_filename(replica_url) + f"_REPLICA_{strategy}.pdf"
-    replica_pdf_path = os.path.join(PDF_FOLDER, replica_pdf_name)
-
-    print("\n[REPLICA]")
-    replica_data = analyze_and_save_pdf(replica_url, replica_pdf_path)
-
-    final_results.append({
-        "Live URL"               : live_url,
-        "Replica URL"            : replica_url,
-
-        "Live Report Link"       : live_data["Report Link"],
-        "Replica Report Link"    : replica_data["Report Link"],
-
-        "Live Status"            : live_data.get("Extraction Flag", ""),
-        "Replica Status"         : replica_data.get("Extraction Flag", ""),
-
-        "Live Performance"       : live_data["Performance"],
-        "Replica Performance"    : replica_data["Performance"],
-
-        "Live Accessibility"     : live_data["Accessibility"],
-        "Replica Accessibility"  : replica_data["Accessibility"],
-
-        "Live Best Practices"    : live_data["Best Practices"],
-        "Replica Best Practices" : replica_data["Best Practices"],
-
-        "Live SEO"               : live_data["SEO"],
-        "Replica SEO"            : replica_data["SEO"],
-
-        "Live FCP"               : live_data["FCP"],
-        "Replica FCP"            : replica_data["FCP"],
-
-        "Live LCP"               : live_data["LCP"],
-        "Replica LCP"            : replica_data["LCP"],
-
-        "Live TBT"               : live_data["TBT"],
-        "Replica TBT"            : replica_data["TBT"],
-
-        "Live CLS"               : live_data["CLS"],
-        "Replica CLS"            : replica_data["CLS"],
-
-        "Live Speed Index"       : live_data["Speed Index"],
-        "Replica Speed Index"    : replica_data["Speed Index"],
-
-        "Live PDF Path"          : live_pdf_path,
-        "Replica PDF Path"       : replica_pdf_path,
-    })
-
-    time.sleep(3)
-
-# =========================================================
-# EXPORT
-# =========================================================
-
-output_df = pd.DataFrame(final_results)
-output_df.to_excel(OUTPUT_FILE, index=False)
-
-print(f"\n{'='*60}")
-print(f"Done! Output: {OUTPUT_FILE}")
-print(f"{'='*60}")
+    logger.info("Log saved to %s", LOG_FILE)
+except Exception:
+    logger.exception("Run stopped before it could finish")
+    sys.exit(1)
